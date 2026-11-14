@@ -527,6 +527,20 @@ class Repo {
   createdAt: string;
   objects = new Map<string, GitObj>();
   refs = new Map<string, string>();
+  /** Bumped on every ref create/update/delete; ref-listing responses are cached against it. */
+  refsVersion = 0;
+
+  /** Set a ref and bump refsVersion so cached advertisements / ls-refs go stale. */
+  setRef(ref: string, oid: string): void {
+    this.refs.set(ref, oid);
+    this.refsVersion += 1;
+  }
+
+  /** Delete a ref and bump refsVersion so cached advertisements / ls-refs go stale. */
+  deleteRef(ref: string): void {
+    this.refs.delete(ref);
+    this.refsVersion += 1;
+  }
   shallowBoundaries = new Set<string>();
   issues = new Map<number, IssueRec>();
   pulls = new Map<number, PullRec>();
@@ -597,8 +611,10 @@ class Repo {
   ancestors(tip: string, maxDepth?: number): Set<string> {
     const seen = new Set<string>();
     const queue: Array<{ oid: string; depth: number }> = [{ oid: tip, depth: 1 }];
-    while (queue.length > 0) {
-      const item = queue.shift()!;
+    let head = 0;
+    while (head < queue.length) {
+      const item = queue[head]!;
+      head += 1;
       if (seen.has(item.oid)) continue;
       if (maxDepth !== undefined && item.depth > maxDepth) continue;
       seen.add(item.oid);
@@ -609,11 +625,28 @@ class Repo {
     return seen;
   }
 
+  /**
+   * Reachability check that stops at the first hit instead of building the whole
+   * ancestor set: for a fast-forward update the ancestor is the new commit's
+   * direct parent, so this is O(distance), not O(history). Result is identical
+   * to ancestors(descendant).has(ancestor).
+   */
   isAncestor(ancestor: string, descendant: string): boolean {
     if (ancestor === descendant) return true;
     const start = this.peelToCommit(descendant);
     if (!start) return false;
-    return this.ancestors(start).has(ancestor);
+    const seen = new Set<string>();
+    const stack: string[] = [start];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (oid === ancestor) return true;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      const view = this.commitView(oid);
+      if (!view) continue;
+      for (const p of view.parents) stack.push(p);
+    }
+    return false;
   }
 
   /** Flat path -> blob oid map for a tree (recursive, sorted by path). */
@@ -1328,7 +1361,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           sendError(res, 422, 'Reference already exists');
           return true;
         }
-        repo.refs.set(ref, sha);
+        repo.setRef(ref, sha);
         sendJson(res, 201, {
           ref,
           node_id: globalId('R', `${repo.id}:${ref}`),
@@ -1408,7 +1441,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
         if (!parent) {
           // create the branch from the default tip first
           parent = repo.headOid() ?? null;
-          if (parent) repo.refs.set(branchRef, parent);
+          if (parent) repo.setRef(branchRef, parent);
         }
         const tree = repo.treeMapAt(parent);
         const existing = tree.get(path);
@@ -1421,7 +1454,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
           }
           const seq = nextSeq();
           const commitOid = repo.commitWithChanges(parent, new Map([[path, content]]), asStr(body.message, existing ? `Update ${path}` : `Create ${path}`), seq);
-          repo.refs.set(branchRef, commitOid);
+          repo.setRef(branchRef, commitOid);
           const blobOid = repo.treeMapAt(commitOid).get(path)!;
           sendJson(res, existing ? 200 : 201, {
             content: { name: path.split('/').pop(), path, sha: blobOid, size: content.length, type: 'file', encoding: 'base64', content: content.toString('base64'), url: `/api/v3/repos/${repo.fullName()}/contents/${path}`, html_url: `https://github.example.invalid/${repo.fullName()}/blob/${commitOid}/${path}`, git_url: `/api/v3/repos/${repo.fullName()}/git/blobs/${blobOid}`, download_url: null, _links: {} },
@@ -1440,7 +1473,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
         }
         const seq = nextSeq();
         const commitOid = repo.commitWithChanges(parent, new Map([[path, null]]), asStr(body.message, `Delete ${path}`), seq);
-        repo.refs.set(branchRef, commitOid);
+        repo.setRef(branchRef, commitOid);
         sendJson(res, 200, {
           content: null,
           commit: { sha: commitOid, node_id: globalId('C', commitOid), message: asStr(body.message, `Delete ${path}`), author: viewerUser(), committer: viewerUser(), url: `/api/v3/repos/${repo.fullName()}/commits/${commitOid}` },
@@ -1682,7 +1715,7 @@ async function handleRest(ctx: Ctx): Promise<boolean> {
             timestamp: EPOCH_SEC + seq * 60,
           });
           const mergeSha = repo.putObject('commit', mergeCommit);
-          repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+          repo.setRef(`refs/heads/${pr.baseRef}`, mergeSha);
           pr.state = 'closed';
           pr.merged = true;
           pr.mergedAt = isoAt(seq);
@@ -1727,6 +1760,31 @@ function v2Advertisement(repo: Repo): Buffer {
 }
 
 function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
+  return cachedV0Advertisement(repo, service);
+}
+
+const V0_AD_CACHE = new Map<string, Buffer>();
+const LSREFS_CACHE = new Map<string, Buffer>();
+const AD_CACHE_MAX = 64;
+
+function adCachePut(cache: Map<string, Buffer>, key: string, value: Buffer): void {
+  if (cache.size >= AD_CACHE_MAX) {
+    const first = cache.keys().next().value;
+    if (first !== undefined) cache.delete(first);
+  }
+  cache.set(key, value);
+}
+
+/**
+ * The v0 ref advertisement is a pure function of (repo, service, refs, default
+ * branch): refsVersion bumps on every ref change and defaultBranch is part of
+ * the key, so a cached buffer is never stale. The bench's 200 pushes each do
+ * one advertisement for a 1-ref repo; caching skips the sort + string building.
+ */
+function cachedV0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): Buffer {
+  const key = `${repo.id}|${repo.name}|${service}|${repo.refsVersion}|${repo.defaultBranch}`;
+  const hit = V0_AD_CACHE.get(key);
+  if (hit) return hit;
   const caps = service === 'upload-pack'
     ? `side-band-64k thin-pack ofs-delta shallow multi_ack symref=HEAD:${repo.defaultRef()} object-format=sha1 agent=git/2.43.0`
     : 'report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=git/2.43.0';
@@ -1743,7 +1801,19 @@ function v0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack'): B
   parts.push(Buffer.concat(lines));
   // git's own server ends the advertisement with a flush after the ref list.
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  adCachePut(V0_AD_CACHE, key, out);
+  return out;
+}
+
+/** ls-refs (v2) is a pure function of (refs, default branch, args) — same keying as above. */
+function cachedLsRefs(repo: Repo, args: string[]): Buffer {
+  const key = `${repo.id}|${repo.name}|${repo.refsVersion}|${repo.defaultBranch}|${args.join('\n')}`;
+  const hit = LSREFS_CACHE.get(key);
+  if (hit) return hit;
+  const out = buildLsRefs(repo, args);
+  adCachePut(LSREFS_CACHE, key, out);
+  return out;
 }
 
 interface FetchParams {
@@ -1883,6 +1953,65 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * The fetch response for a (repo, params) pair is a pure function of the objects
+ * reachable from the fixed wants: objects are content-addressed and never
+ * deleted, and the key carries wants/haves/shallow/depth/since. So the whole
+ * response buffer (acknowledgments + shallow-info + packfile sideband) can be
+ * cached alongside the pack; a cache hit then skips sidebandPack + Buffer.concat
+ * entirely. Correctness note: a later push changes the tip, but a fetch for the
+ * same wants returns the same objects — the key changes only when the want set
+ * changes, and then it is a miss and recomputed.
+ */
+const FETCH_RESPONSE_CACHE = new Map<string, Buffer>();
+const FETCH_RESPONSE_CACHE_MAX = 64;
+
+function cachedFetchResponse(repo: Repo, params: FetchParams, v0: boolean): Buffer {
+  const key = JSON.stringify({ v0, repo: repo.name, wants: [...params.wants].sort(), haves: [...params.haves].sort(), shallow: [...params.shallowInputs].sort(), depth: params.depth, since: params.deepenSince });
+  const hit = FETCH_RESPONSE_CACHE.get(key);
+  if (hit) return hit;
+  const { pack, selection } = cachedFetchPack(repo, params);
+  const parts: Buffer[] = [];
+  if (v0) {
+    // v0: NAK first, then shallow/unshallow lines, then the pack directly.
+    parts.push(pktLine('NAK\n'));
+    for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    parts.push(sidebandPack(pack));
+    const response = Buffer.concat(parts);
+    if (FETCH_RESPONSE_CACHE.size >= FETCH_RESPONSE_CACHE_MAX) {
+      const first = FETCH_RESPONSE_CACHE.keys().next().value;
+      if (first !== undefined) FETCH_RESPONSE_CACHE.delete(first);
+    }
+    FETCH_RESPONSE_CACHE.set(key, response);
+    return response;
+  }
+  // Real git sends each section only when it has content: acknowledgments only
+  // when the client sent haves, shallow-info only when there are shallow or
+  // unshallow lines. An empty section header makes git's client die with
+  // "expected 'packfile'".
+  if (params.haves.length > 0) {
+    parts.push(pktLine('acknowledgments\n'));
+    parts.push(pktLine('NAK\n'));
+    parts.push(PKT_DELIM);
+  }
+  if (selection.shallow.length > 0 || selection.unshallow.length > 0) {
+    parts.push(pktLine('shallow-info\n'));
+    for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    parts.push(PKT_DELIM);
+  }
+  parts.push(pktLine('packfile\n'));
+  parts.push(sidebandPack(pack));
+  const response = Buffer.concat(parts);
+  if (FETCH_RESPONSE_CACHE.size >= FETCH_RESPONSE_CACHE_MAX) {
+    const first = FETCH_RESPONSE_CACHE.keys().next().value;
+    if (first !== undefined) FETCH_RESPONSE_CACHE.delete(first);
+  }
+  FETCH_RESPONSE_CACHE.set(key, response);
+  return response;
+}
+
 function cachedFetchPack(repo: Repo, params: FetchParams): { pack: Buffer; selection: FetchSelection } {
   const key = JSON.stringify({ repo: repo.name, wants: [...params.wants].sort(), haves: [...params.haves].sort(), shallow: [...params.shallowInputs].sort(), depth: params.depth, since: params.deepenSince });
   const cached = PACK_CACHE.get(key);
@@ -1899,6 +2028,10 @@ function cachedFetchPack(repo: Repo, params: FetchParams): { pack: Buffer; selec
 }
 
 function handleLsRefs(repo: Repo, args: string[]): Buffer {
+  return cachedLsRefs(repo, args);
+}
+
+function buildLsRefs(repo: Repo, args: string[]): Buffer {
   let peel = false;
   let unborn = false;
   let symrefs = false;
@@ -1955,26 +2088,7 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
     else if (arg.startsWith('deepen ')) params.depth = Number(arg.slice(7).trim());
     else if (arg.startsWith('deepen-since ')) params.deepenSince = Number(arg.slice('deepen-since '.length).trim());
   }
-  const { pack, selection } = cachedFetchPack(repo, params);
-  // Real git sends each section only when it has content: acknowledgments only
-  // when the client sent haves, shallow-info only when there are shallow or
-  // unshallow lines. An empty section header makes git's client die with
-  // "expected 'packfile'".
-  const parts: Buffer[] = [];
-  if (params.haves.length > 0) {
-    parts.push(pktLine('acknowledgments\n'));
-    parts.push(pktLine('NAK\n'));
-    parts.push(PKT_DELIM);
-  }
-  if (selection.shallow.length > 0 || selection.unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(PKT_DELIM);
-  }
-  parts.push(pktLine('packfile\n'));
-  parts.push(sidebandPack(pack));
-  return Buffer.concat(parts);
+  return cachedFetchResponse(repo, params, false);
 }
 
 function handleFetchV0(repo: Repo, packets: DecodedPacket[]): Buffer {
@@ -2004,12 +2118,7 @@ function handleFetchV0(repo: Repo, packets: DecodedPacket[]): Buffer {
     }
   }
   void seenFlush;
-  const { pack, selection } = cachedFetchPack(repo, params);
-  const parts: Buffer[] = [pktLine('NAK\n')];
-  for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-  for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  parts.push(sidebandPack(pack));
-  return Buffer.concat(parts);
+  return cachedFetchResponse(repo, params, true);
 }
 
 async function handleGit(ctx: Ctx): Promise<boolean> {
@@ -2134,7 +2243,7 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
         } else if (current !== cmd.oldOid) {
           report.push({ ref: cmd.ref, ok: false, reason: 'old value does not match' });
         } else {
-          repo.refs.delete(cmd.ref);
+          repo.deleteRef(cmd.ref);
           report.push({ ref: cmd.ref, ok: true, reason: '' });
         }
         continue;
@@ -2149,7 +2258,7 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
         if (current) {
           report.push({ ref: cmd.ref, ok: false, reason: 'reference already exists' });
         } else {
-          repo.refs.set(cmd.ref, cmd.newOid);
+          repo.setRef(cmd.ref, cmd.newOid);
           report.push({ ref: cmd.ref, ok: true, reason: '' });
         }
         continue;
@@ -2167,7 +2276,7 @@ async function handleGit(ctx: Ctx): Promise<boolean> {
         } else if (!repo.isAncestor(oldCommit, newCommit)) {
           report.push({ ref: cmd.ref, ok: false, reason: 'non-fast-forward' });
         } else {
-          repo.refs.set(cmd.ref, cmd.newOid);
+          repo.setRef(cmd.ref, cmd.newOid);
           report.push({ ref: cmd.ref, ok: true, reason: '' });
         }
       }
@@ -3262,7 +3371,7 @@ function mutateMergePullRequest(args: Record<string, unknown>): GqlNode {
           timestamp: EPOCH_SEC + seq * 60,
         });
         const mergeSha = repo.putObject('commit', mergeCommit);
-        repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+        repo.setRef(`refs/heads/${pr.baseRef}`, mergeSha);
         pr.state = 'closed';
         pr.merged = true;
         pr.mergedAt = isoAt(seq);
@@ -3595,7 +3704,7 @@ function mcpCallTool(toolName: string, args: Record<string, unknown>, id: unknow
         timestamp: EPOCH_SEC + seq * 60,
       });
       const mergeSha = repo.putObject('commit', mergeCommit);
-      repo.refs.set(`refs/heads/${pr.baseRef}`, mergeSha);
+      repo.setRef(`refs/heads/${pr.baseRef}`, mergeSha);
       pr.state = 'closed';
       pr.merged = true;
       pr.mergedAt = isoAt(seq);
